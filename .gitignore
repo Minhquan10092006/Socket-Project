@@ -1,0 +1,9 @@
+# Ignore Java class files
+*.class
+
+# Ignore IDE settings (VS Code)
+.vscode/
+
+# Ignore temporary files
+*.log
+*.tmp
