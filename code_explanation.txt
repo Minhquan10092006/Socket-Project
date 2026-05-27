@@ -1,0 +1,636 @@
+================================================================================
+              SOCKET-PROJECT — FULL CODE EXPLANATION
+              Production-Grade Multi-Client TCP Chat Application
+              Version 2.0
+================================================================================
+
+TABLE OF CONTENTS
+─────────────────
+  1. Project Overview
+  2. Architecture & Data Flow
+  3. File-by-File Explanation
+     3.1  Server.java
+     3.2  ClientHandler.java
+     3.3  Client.java + ServerListener
+  4. The Chat Protocol
+  5. Threading Model
+  6. Command System
+  7. Key Java Concepts Used
+  8. Cloud Engineering Concepts Demonstrated
+  9. Bugs Fixed from the Original Code
+  10. How to Run
+  11. Example Chat Session
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+This is a real-time, multi-client TCP chat application built in Java.
+
+Architecture: Client-Server (hub-and-spoke)
+  - ONE Server:   Listens on a TCP port, accepts connections, relays messages
+  - MANY Clients: Connect to the server, send/receive messages in real-time
+
+Message path:  Client A → Server → All Other Clients (broadcast)
+               Client A → Server → Client B only     (unicast / private message)
+
+The project demonstrates production-grade patterns:
+  - Thread pool (ExecutorService) instead of raw Thread creation
+  - Graceful shutdown with JVM ShutdownHook
+  - Server admin console for operational management
+  - Private messaging with unicast routing
+  - Structured logging with timestamps
+  - Connection metadata tracking
+  - Configurable host/port via command-line arguments
+  - Thread-safe concurrent data structures
+
+================================================================================
+2. ARCHITECTURE & DATA FLOW
+================================================================================
+
+SERVER SIDE:
+  ┌────────────────────────────────────────────────────────────────┐
+  │                        SERVER (Server.java)                    │
+  │                                                                │
+  │  Main Thread: while(true) { socket = accept(); pool.submit() }│
+  │                                                                │
+  │  ExecutorService (Fixed Thread Pool, 50 threads)               │
+  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐        │
+  │  │ClientHandler │  │ClientHandler │  │ClientHandler │ ...    │
+  │  │  (Thread 1)  │  │  (Thread 2)  │  │  (Thread N)  │        │
+  │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘        │
+  │         └────────────┬────┘────────────┘                      │
+  │                      ▼                                         │
+  │  CopyOnWriteArrayList<ClientHandler> clients                   │
+  │         │                                                      │
+  │         ├── broadcast(msg, sender) → sends to all except sender│
+  │         ├── unicast(target, msg)   → sends to one specific user│
+  │         └── getOnlineUsers()       → lists all nicknames       │
+  │                                                                │
+  │  Admin Console (daemon thread): /list /kick /stats /shutdown   │
+  │  Shutdown Hook: Runtime.addShutdownHook(cleanup)               │
+  └────────────────────────────────────────────────────────────────┘
+
+CLIENT SIDE:
+  ┌────────────────────────────────────────────────────────────────┐
+  │  Client.java                                                   │
+  │  ┌─────────────────┐  ┌─────────────────────┐                │
+  │  │  Main Thread     │  │  ServerListener      │                │
+  │  │  (Sender)        │  │  (Receiver/Daemon)   │                │
+  │  │                  │  │                      │                │
+  │  │  scanner.next()  │  │  reader.readLine()   │                │
+  │  │  writer.println()│  │  println() to console│                │
+  │  └────────┬─────────┘  └──────────┬───────────┘                │
+  │           │                       │                            │
+  │           └───────────────────────┘                            │
+  │                     Socket                                     │
+  └────────────────────────────────────────────────────────────────┘
+
+DATA FLOW (sending a message):
+  1. User types "Hello" in Client A's terminal
+  2. Client A's main thread sends "Hello" via socket → Server
+  3. Server's ClientHandler for Client A receives "Hello" via readLine()
+  4. ClientHandler calls Server.broadcast("[Alice]: Hello", this)
+  5. broadcast() iterates CopyOnWriteArrayList, sends to all EXCEPT Alice
+  6. Each other client's ServerListener thread receives and prints it
+
+DATA FLOW (private message):
+  1. User types "/msg Bob secret info" in Client A
+  2. Client A sends raw string to server
+  3. ClientHandler.handleCommand() detects the /msg prefix
+  4. handlePrivateMessage() parses target="Bob", message="secret info"
+  5. Server.unicast("Bob", "[PM from Alice]: secret info", handler)
+  6. unicast() finds Bob's ClientHandler and calls sendMessage()
+  7. Only Bob sees the message. Alice sees a confirmation echo.
+
+================================================================================
+3. FILE-BY-FILE EXPLANATION
+================================================================================
+
+───────────────────────────────────────────────────────────────────────────────
+3.1  Server.java — The Central Chat Server
+───────────────────────────────────────────────────────────────────────────────
+
+PURPOSE: Main server application. Listens for TCP connections, manages
+         client lifecycle, and provides admin operations.
+
+KEY DESIGN DECISIONS:
+
+  ● ExecutorService Thread Pool (line ~70)
+    ─ Uses Executors.newFixedThreadPool(50) instead of new Thread().
+    ─ WHY: Raw thread creation has no limit — if 10,000 clients connect,
+      10,000 threads would be created, crashing the JVM with OutOfMemoryError.
+    ─ The thread pool caps concurrent threads at 50 and REUSES threads
+      when clients disconnect. This is how production servers work.
+    ─ CLOUD RELEVANCE: Mirrors how cloud services manage capacity
+      (e.g., connection limits in AWS ALB, thread pools in Tomcat).
+
+  ● CopyOnWriteArrayList<ClientHandler> clients
+    ─ Thread-safe list shared across all handler threads.
+    ─ Multiple threads read (broadcast iteration) and write (add/remove).
+    ─ CopyOnWriteArrayList creates a snapshot on each write, so reads
+      never block and never throw ConcurrentModificationException.
+    ─ Ideal for read-heavy, write-rare scenarios (broadcasts are frequent,
+      joins/leaves are infrequent).
+
+  ● Graceful Shutdown Hook (line ~75)
+    ─ Runtime.addShutdownHook() registers code that runs when the JVM
+      receives a termination signal (Ctrl+C, kill, SIGTERM).
+    ─ The hook: notifies all clients, closes all sockets, shuts down
+      the thread pool, and closes the server socket.
+    ─ CLOUD RELEVANCE: Essential for containerized services (Docker/K8s)
+      where pods receive SIGTERM before being killed.
+
+  ● Admin Console (adminConsole method)
+    ─ Runs in a daemon thread, reading from System.in.
+    ─ Provides operational commands: /list, /kick, /stats, /say, /shutdown.
+    ─ CLOUD RELEVANCE: Mirrors admin CLIs in production systems (redis-cli,
+      mysql admin commands, etc.)
+
+  ● Server Statistics (AtomicInteger/AtomicLong)
+    ─ Tracks totalConnections, totalMessages, and uptime.
+    ─ Uses atomic types for lock-free thread-safe increments.
+    ─ CLOUD RELEVANCE: Mirrors metrics exposed via /metrics endpoints
+      (Prometheus, CloudWatch, Datadog).
+
+  ● Configurable Port (parsePort method)
+    ─ Supports: java Server 8080 or java Server --port 8080
+    ─ CLOUD RELEVANCE: Production services are always port-configurable
+      for deployment flexibility (Docker port mapping, K8s services).
+
+METHODS:
+
+  main(args)         Entry point. Parses port, creates pool, starts accept loop.
+  broadcast(msg, s)  Sends message to all clients except sender.
+  unicast(name,msg,s) Sends private message to one client by nickname.
+  removeClient(h)    Removes a handler from the active list.
+  getClientByName(n) Finds a handler by nickname (case-insensitive).
+  getOnlineUsers()   Returns list of all connected nicknames.
+  getOnlineCount()   Returns count of connected clients.
+  recordMessage()    Increments the global message counter.
+  getStats()         Returns formatted statistics string.
+  adminConsole()     Reads admin commands from System.in.
+  shutdownServer()   Closes all clients, pool, and server socket.
+  parsePort(args)    Parses port from command-line arguments.
+  log(cat, msg)      Structured logging: [timestamp] [category] message.
+
+───────────────────────────────────────────────────────────────────────────────
+3.2  ClientHandler.java — Per-Client Handler with Command Routing
+───────────────────────────────────────────────────────────────────────────────
+
+PURPOSE: Manages one client's connection on the server side. Runs in a
+         thread from the ExecutorService pool. Handles all I/O, command
+         routing, and lifecycle for that client.
+
+KEY DESIGN DECISIONS:
+
+  ● Command Routing (handleCommand method)
+    ─ Messages starting with "/" are routed to command handlers.
+    ─ Regular messages are broadcast to all other clients.
+    ─ This is a simple text-based protocol — no binary framing.
+    ─ CLOUD RELEVANCE: Protocol design is fundamental to API/service design.
+
+  ● Connection Metadata
+    ─ clientIP:      Captured at construction time (before socket can close).
+    ─ joinTime:      Recorded via LocalDateTime.now() at construction.
+    ─ messageCount:  AtomicInteger incremented per chat message.
+    ─ CLOUD RELEVANCE: Audit logging, connection tracking, metrics.
+
+  ● Duplicate Nickname Detection
+    ─ On join, checks if the nickname is already taken.
+    ─ If so, appends a hash suffix to make it unique.
+    ─ CLOUD RELEVANCE: Identity management, uniqueness constraints.
+
+  ● volatile boolean running
+    ─ Used to signal the handler to stop from another thread (e.g., /kick).
+    ─ volatile ensures visibility across threads without synchronization.
+    ─ When disconnect() is called, running=false and socket.close() causes
+      readLine() to throw IOException, breaking the loop.
+
+  ● Null-Safety
+    ─ sendMessage() checks writer != null and !socket.isClosed().
+    ─ nickname defaults to "Anonymous" if null or empty.
+    ─ Empty messages are skipped.
+
+METHODS:
+
+  sendMessage(msg)        Sends text to this client. Thread-safe.
+  getNickname()           Returns nickname.
+  getClientIP()           Returns IP address string.
+  getMessageCount()       Returns number of messages sent.
+  getJoinTime()           Returns formatted join time.
+  disconnect()            Force-closes the socket (used by /kick, /shutdown).
+  run()                   Main loop: read nickname → broadcast join → message loop → cleanup.
+  handleCommand(input)    Routes /msg, /list, /help, /stats to sub-handlers.
+  handlePrivateMessage()  Parses /msg <target> <text> and calls Server.unicast().
+  handleListUsers()       Sends formatted user list to this client.
+  handleHelp()            Sends command reference to this client.
+
+───────────────────────────────────────────────────────────────────────────────
+3.3  Client.java + ServerListener — The Chat Client
+───────────────────────────────────────────────────────────────────────────────
+
+PURPOSE: Connects to the server, enables the user to type messages and
+         receive messages from others in real-time.
+
+KEY DESIGN DECISIONS:
+
+  ● Two-Thread Architecture
+    ─ Main thread: reads user input from console → sends to server.
+    ─ ServerListener (daemon): reads server messages → prints to console.
+    ─ WHY: Both operations (Scanner.nextLine, BufferedReader.readLine) are
+      BLOCKING calls. Without separate threads, the client would freeze
+      while waiting for either user input or server data.
+
+  ● volatile boolean connected
+    ─ When the server disconnects, the listener thread sets connected=false.
+    ─ The main thread checks this flag to exit its input loop.
+    ─ volatile ensures the flag change is visible across threads immediately.
+
+  ● Daemon Thread for Listener
+    ─ setDaemon(true) means the JVM won't wait for this thread to finish.
+    ─ When the main thread exits, the daemon is killed automatically.
+    ─ Without this, the blocked readLine() would keep the JVM alive forever.
+
+  ● NoSuchElementException Protection
+    ─ The main loop wraps scanner.nextLine() in a try-catch.
+    ─ If System.in is closed (e.g., piped input ends), it catches the
+      exception and exits gracefully instead of crashing.
+
+  ● Configurable Host/Port
+    ─ Supports: java Client 192.168.1.10 8080
+    ─ Or:       java Client --host 10.0.0.1 --port 8080
+    ─ CLOUD RELEVANCE: Clients need to point to different environments
+      (dev, staging, prod) via configuration.
+
+METHODS (Client.java):
+
+  main(args)           Entry point. Parses args, connects, starts listener, input loop.
+  parseHost(args, def) Extracts hostname from CLI arguments.
+  parsePort(args, def) Extracts port from CLI arguments.
+  onServerDisconnect() Called by listener thread to signal main thread to exit.
+
+METHODS (ServerListener):
+
+  run()                Loop: readLine() → println(). On null, calls onServerDisconnect().
+
+================================================================================
+4. THE CHAT PROTOCOL
+================================================================================
+
+This application uses a simple, line-based text protocol over TCP:
+
+HANDSHAKE:
+  Client → Server:  <nickname>\n        (first line = nickname)
+  Server → Client:  [SERVER] Welcome... (personal welcome)
+  Server → Others:  [SERVER] X joined   (join announcement)
+
+CHAT MESSAGE:
+  Client → Server:  <text>\n
+  Server → Others:  [<nickname>]: <text>\n
+
+PRIVATE MESSAGE:
+  Client → Server:  /msg <target> <text>\n
+  Server → Target:  [PM from <sender>]: <text>\n
+  Server → Sender:  [PM to <target>]: <text>\n
+
+COMMANDS:
+  Client → Server:  /list\n  →  Server → Client: user list
+  Client → Server:  /help\n  →  Server → Client: command reference
+  Client → Server:  /stats\n →  Server → Client: server statistics
+
+DISCONNECT:
+  Client → Server:  exit\n
+  Server → Client:  [SERVER] Goodbye, <nickname>!
+  Server → Others:  [SERVER] <nickname> has left...
+
+All messages are UTF-8 text terminated by newline (\n).
+PrintWriter.println() adds the newline automatically.
+BufferedReader.readLine() strips the newline automatically.
+
+================================================================================
+5. THREADING MODEL
+================================================================================
+
+SERVER:
+  ┌──────────────────────────────────────────────────────┐
+  │ Main Thread                                          │
+  │   └─ while(true) { accept() → pool.submit(handler) }│
+  │                                                      │
+  │ Thread Pool (50 threads max, ExecutorService)        │
+  │   ├─ Handler Thread 1 (Client A): readLine loop     │
+  │   ├─ Handler Thread 2 (Client B): readLine loop     │
+  │   └─ Handler Thread N (Client N): readLine loop     │
+  │                                                      │
+  │ Admin Thread (daemon)                                │
+  │   └─ reads System.in for admin commands              │
+  │                                                      │
+  │ Shutdown Hook Thread (registered, not started)       │
+  │   └─ runs on JVM termination signal                  │
+  └──────────────────────────────────────────────────────┘
+
+  Thread count: 3 + N (where N = connected clients, max 50)
+
+CLIENT:
+  ┌──────────────────────────────────────────────────────┐
+  │ Main Thread (Sender)                                 │
+  │   └─ while(connected) { readConsole → sendToServer } │
+  │                                                      │
+  │ Daemon Thread (ServerListener / Receiver)            │
+  │   └─ while(readLine != null) { printToConsole }      │
+  └──────────────────────────────────────────────────────┘
+
+  Thread count: 2 per client
+
+THREAD SAFETY MECHANISMS:
+  - CopyOnWriteArrayList: safe iteration during broadcast while clients join/leave
+  - AtomicInteger/AtomicLong: lock-free counters for statistics
+  - volatile boolean: cross-thread flag for running/connected state
+  - Daemon threads: auto-cleanup on JVM exit
+
+================================================================================
+6. COMMAND SYSTEM
+================================================================================
+
+CLIENT-SIDE COMMANDS (processed by ClientHandler on server):
+
+  /msg <user> <text>
+    ─ Parses the target nickname and message body.
+    ─ Calls Server.unicast() which finds the target's ClientHandler.
+    ─ Sends formatted PM to target and confirmation to sender.
+    ─ If target not found, sends error to sender.
+
+  /list
+    ─ Calls Server.getOnlineUsers() to get all nicknames.
+    ─ Formats as numbered list with "(you)" marker.
+    ─ Sends only to the requesting client.
+
+  /stats
+    ─ Calls Server.getStats() for uptime, connections, messages.
+    ─ Sends formatted statistics to the requesting client.
+
+  /help
+    ─ Sends a formatted command reference box to the client.
+
+  exit
+    ─ Sends goodbye message, breaks the handler loop.
+    ─ Finally block handles cleanup and departure broadcast.
+
+SERVER-SIDE ADMIN COMMANDS (processed in Server.adminConsole):
+
+  /list
+    ─ Shows all users with IP, message count, and join time.
+
+  /kick <user>
+    ─ Finds the target handler, sends kick notification, calls disconnect().
+
+  /stats
+    ─ Prints server statistics to the admin console.
+
+  /say <message>
+    ─ Broadcasts a [SERVER ANNOUNCEMENT] to all clients.
+
+  /shutdown
+    ─ Broadcasts shutdown notice, calls shutdownServer(), exits.
+
+  /help
+    ─ Prints admin command reference.
+
+================================================================================
+7. KEY JAVA CONCEPTS USED
+================================================================================
+
+  ● ServerSocket / Socket (java.net)
+    - ServerSocket.accept() blocks until a connection arrives.
+    - Socket provides getInputStream() and getOutputStream() for I/O.
+
+  ● ExecutorService (java.util.concurrent)
+    - Manages a pool of reusable threads.
+    - submit(runnable) assigns a task to an available thread.
+    - shutdownNow() stops all running tasks.
+
+  ● CopyOnWriteArrayList (java.util.concurrent)
+    - Thread-safe List. Creates a copy on each mutation.
+    - Iteration is always safe (snapshot semantics).
+
+  ● AtomicInteger / AtomicLong (java.util.concurrent.atomic)
+    - Lock-free thread-safe counters using CAS (Compare-And-Swap).
+    - incrementAndGet() is atomic across threads.
+
+  ● volatile keyword
+    - Ensures a variable's value is always read from main memory,
+      not from a thread-local cache.
+    - Used for the 'running' and 'connected' flags.
+
+  ● PrintWriter / BufferedReader (java.io)
+    - Line-based text I/O over socket streams.
+    - Auto-flush mode for immediate sending.
+
+  ● try-with-resources
+    - Automatic resource cleanup (sockets, readers, scanners).
+
+  ● Runtime.addShutdownHook(Thread)
+    - Registers a thread that runs when the JVM is shutting down.
+    - Used for graceful cleanup on Ctrl+C or SIGTERM.
+
+  ● daemon threads
+    - Thread.setDaemon(true) marks a thread as daemon.
+    - JVM exits when only daemon threads remain (no waiting).
+
+================================================================================
+8. CLOUD ENGINEERING CONCEPTS DEMONSTRATED
+================================================================================
+
+  ● Networked Service Design
+    - Client-server TCP architecture mirrors microservice communication.
+    - Custom text protocol parallels HTTP/gRPC protocol design.
+
+  ● Concurrency & Resource Management
+    - Thread pool limits resource consumption (like connection pools
+      in databases, or container CPU/memory limits in Kubernetes).
+    - Atomic operations for lock-free concurrency.
+
+  ● Graceful Lifecycle Management
+    - Shutdown hooks ensure clean resource release on termination.
+    - This is critical in container orchestration (K8s SIGTERM handling,
+      AWS ECS task stopping, GCP Cloud Run instance shutdown).
+
+  ● Observability & Monitoring
+    - Structured logging with timestamps and categories mirrors
+      production log formats (JSON logging, ELK stack, CloudWatch).
+    - Server statistics parallel Prometheus /metrics endpoints.
+    - Connection metadata tracking for audit trails.
+
+  ● Configuration Management
+    - CLI arguments for host/port parallel environment variables
+      and config files used in cloud deployments.
+
+  ● Operational Tooling
+    - Admin console parallels operational CLIs (kubectl, aws cli, gcloud).
+    - /kick and /shutdown mirror admin operations on cloud services.
+
+  ● Scalability Patterns
+    - Thread pool limits prevent resource exhaustion.
+    - CopyOnWriteArrayList optimizes for read-heavy workloads.
+    - The architecture could be extended to multiple server nodes
+      with a message broker (Redis Pub/Sub, Kafka, RabbitMQ).
+
+================================================================================
+9. BUGS FIXED FROM THE ORIGINAL CODE
+================================================================================
+
+  BUG #1: METHOD NAME MISMATCH (CRITICAL — compile error)
+  ────────────────────────────────────────────────────────
+  ORIGINAL: ClientHandler.java had Message() but Server.java called sendMessage().
+            The project could not compile at all.
+  FIX:      Unified the method name to sendMessage() across all files.
+
+  BUG #2: BLOCKING CLIENT (CRITICAL — chat unusable)
+  ──────────────────────────────────────────────────
+  ORIGINAL: Client.java read from server in the SAME thread as user input.
+            After sending, it blocked on readLine() waiting for a response.
+  FIX:      Created ServerListener thread for asynchronous message receiving.
+
+  BUG #3: RAW THREAD CREATION (scalability risk)
+  ──────────────────────────────────────────────
+  ORIGINAL: new Thread(handler).start() for each client — no limit.
+  FIX:      ExecutorService thread pool with configurable size (default 50).
+
+  BUG #4: NO DEPARTURE NOTIFICATION
+  ─────────────────────────────────
+  ORIGINAL: Clients vanished silently when disconnecting.
+  FIX:      Departure broadcast in finally block + online count.
+
+  BUG #5: NO WELCOME MESSAGE
+  ──────────────────────────
+  ORIGINAL: No confirmation of successful connection.
+  FIX:      Personal welcome message with online count and command help.
+
+  BUG #6: NULL NICKNAME CRASH
+  ───────────────────────────
+  ORIGINAL: Null nickname caused NullPointerException.
+  FIX:      Default to "Anonymous" with null/empty check.
+
+  BUG #7: EMPTY MESSAGE BROADCAST
+  ───────────────────────────────
+  ORIGINAL: Blank Enter key broadcast empty messages.
+  FIX:      message.trim().isEmpty() check skips blank lines.
+
+  BUG #8: NO CONNECTION ERROR HANDLING
+  ───────────────────────────────────
+  ORIGINAL: Raw ConnectException with no helpful message.
+  FIX:      Specific catch with user-friendly instructions.
+
+  BUG #9: NO RESOURCE CLEANUP
+  ──────────────────────────
+  ORIGINAL: No shutdown hook, no thread pool shutdown, no graceful exit.
+  FIX:      ShutdownHook + shutdownServer() method for complete cleanup.
+
+  BUG #10: NoSuchElementException CRASH
+  ────────────────────────────────────
+  ORIGINAL: If server shut down while client was reading input, scanner
+            threw NoSuchElementException and crashed.
+  FIX:      Try-catch around scanner.nextLine() with graceful exit.
+
+================================================================================
+10. HOW TO RUN
+================================================================================
+
+  PREREQUISITES:
+    - Java JDK 8 or later
+
+  COMPILE:
+    > javac Server.java ClientHandler.java Client.java
+
+  START SERVER:
+    > java Server                  (port 5000)
+    > java Server 8080             (port 8080)
+    > java Server --port 8080      (port 8080)
+
+  START CLIENTS (separate terminals):
+    > java Client                             (localhost:5000)
+    > java Client 192.168.1.10 8080           (remote host)
+    > java Client --host 10.0.0.1 --port 8080 (named args)
+
+  ADMIN COMMANDS (in the server terminal):
+    > /list       — see connected users
+    > /kick Alice  — disconnect Alice
+    > /stats      — server statistics
+    > /say Hello! — broadcast announcement
+    > /shutdown   — graceful shutdown
+
+================================================================================
+11. EXAMPLE CHAT SESSION
+================================================================================
+
+  === Terminal 1 (Server) ===
+  > java Server
+  ╔══════════════════════════════════════════════╗
+  ║       TCP Chat Server v2.0                   ║
+  ║       Production-Grade Socket Server         ║
+  ╠══════════════════════════════════════════════╣
+  ║  Port:        5000                           ║
+  ║  Thread Pool: 50                             ║
+  ║  Started:     2026-05-25 23:30:00            ║
+  ║  Status:      READY                          ║
+  ╠══════════════════════════════════════════════╣
+  ║  Type /help for admin commands               ║
+  ╚══════════════════════════════════════════════╝
+  [2026-05-25 23:30:05] [CONN] New connection from 127.0.0.1 (total: 1)
+  [2026-05-25 23:30:08] [JOIN] Alice joined from 127.0.0.1
+  [2026-05-25 23:30:15] [CONN] New connection from 127.0.0.1 (total: 2)
+  [2026-05-25 23:30:18] [JOIN] Bob joined from 127.0.0.1
+  [2026-05-25 23:30:25] [CHAT] Alice: Hello Bob!
+  [2026-05-25 23:30:30] [PM]   Alice → Bob: secret meeting at 3pm
+  [2026-05-25 23:30:45] [LEFT] Alice left. Messages sent: 2
+
+  > /stats
+  Server Statistics:
+    Uptime:             00:00:45
+    Online clients:     1
+    Total connections:  2
+    Messages relayed:   2
+    Thread pool size:   50
+
+  > /kick Bob
+  [2026-05-25 23:31:00] [ADMIN] Kicked user: Bob
+
+  === Terminal 2 (Client - Alice) ===
+  > java Client
+  ╔══════════════════════════════════════════════╗
+  ║       TCP Chat Client v2.0                   ║
+  ╠══════════════════════════════════════════════╣
+  ║  Connected to: localhost:5000                ║
+  ╚══════════════════════════════════════════════╝
+  Enter your nickname: Alice
+  ───────────────────────────────────────────────
+    Welcome, Alice!
+    Type /help for commands, 'exit' to leave.
+  ───────────────────────────────────────────────
+  [SERVER] Welcome, Alice! Online: 1
+  [SERVER] Bob has joined the chat! (Online: 2)
+  > Hello Bob!
+  > /msg Bob secret meeting at 3pm
+  [PM to Bob]: secret meeting at 3pm
+  > /list
+  [SERVER] Online users (2):
+    1. Alice (you)
+    2. Bob
+  > exit
+  [INFO] Disconnecting...
+
+  === Terminal 3 (Client - Bob) ===
+  > java Client
+  Enter your nickname: Bob
+  [SERVER] Welcome, Bob! Online: 2
+  [Alice]: Hello Bob!
+  [PM from Alice]: secret meeting at 3pm
+  [SERVER] Alice has left the chat. (Online: 1)
+  [SERVER] You have been kicked by an admin.
+
+  [INFO] Server connection closed.
+  [INFO] Press Enter to exit.
+
+================================================================================
+                          END OF EXPLANATION
+================================================================================
