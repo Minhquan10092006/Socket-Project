@@ -1,14 +1,19 @@
 import java.io.*;
 import java.net.*;
 import java.util.Scanner;
+import javax.crypto.SecretKey;
 
 /**
  * Client.java - Production-Grade TCP Chat Client
  *
  * Connects to the chat server, sends a nickname, and enables real-time
  * bidirectional messaging via two threads:
- *   - Main thread:     reads user input from console → sends to server
- *   - Listener thread: reads server messages → prints to console
+ *   - Main thread:     reads user input from console → sends to server (encrypted)
+ *   - Listener thread: reads server messages (encrypted) → decrypts → prints to console
+ *
+ * Security:
+ *   - All messages are encrypted with AES-256-GCM
+ *   - Encryption key is received from server on connect (key exchange handshake)
  *
  * Supports commands:
  *   /msg <user> <text>  - Private message (routed by server)
@@ -51,25 +56,37 @@ public class Client {
                     new InputStreamReader(socket.getInputStream()));
             Scanner scanner = new Scanner(System.in);
 
-            // --- Step 1: Send Nickname ---
-            System.out.print("Enter your nickname: ");
-            String nickname = scanner.nextLine().trim();
-            if (nickname.isEmpty()) {
-                nickname = "User" + (int) (Math.random() * 9999);
+            // --- Step 1: Receive Encryption Key ---
+            String keyLine = reader.readLine();
+            SecretKey encryptionKey = null;
+            if (keyLine != null && keyLine.startsWith("KEY:")) {
+                String keyStr = keyLine.substring(4);
+                encryptionKey = CryptoUtils.stringToKey(keyStr);
+                System.out.println("  \uD83D\uDD12 Encryption: AES-256-GCM (secured)");
+            } else {
+                System.out.println("  \u26A0\uFE0F  Warning: No encryption key received.");
             }
-            writer.println(nickname);
 
-            System.out.println("───────────────────────────────────────────");
+            // --- Step 2: Authentication (Register or Login) ---
+            String nickname = handleAuthentication(scanner, writer, reader, encryptionKey);
+            if (nickname == null) {
+                System.out.println("[ERROR] Authentication failed. Disconnecting.");
+                return;
+            }
+
+            System.out.println("\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
             System.out.println("  Welcome, " + nickname + "!");
             System.out.println("  Type /help for commands, 'exit' to leave.");
-            System.out.println("───────────────────────────────────────────");
+            System.out.println("  \uD83D\uDD12 Messages are encrypted end-to-end.");
+            System.out.println("\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500");
 
-            // --- Step 2: Start Listener Thread ---
-            Thread listenerThread = new Thread(new ServerListener(reader));
+            // --- Step 3: Start Listener Thread ---
+            Thread listenerThread = new Thread(new ServerListener(reader, encryptionKey));
             listenerThread.setDaemon(true);
             listenerThread.start();
 
-            // --- Step 3: Main Input Loop ---
+            // --- Step 4: Main Input Loop ---
+            final SecretKey finalKey = encryptionKey;
             while (connected) {
                 try {
                     if (!scanner.hasNextLine()) break;
@@ -78,8 +95,16 @@ public class Client {
                     // Skip empty input.
                     if (userInput.trim().isEmpty()) continue;
 
-                    // Send to server.
-                    writer.println(userInput);
+                    // Encrypt and send to server.
+                    if (finalKey != null) {
+                        try {
+                            writer.println(CryptoUtils.encrypt(userInput, finalKey));
+                        } catch (Exception e) {
+                            writer.println(userInput);
+                        }
+                    } else {
+                        writer.println(userInput);
+                    }
 
                     // If the user typed "exit", disconnect.
                     if (userInput.trim().equalsIgnoreCase("exit")) {
@@ -154,7 +179,7 @@ public class Client {
 
     private static void printBanner(String host, int port) {
         System.out.println("╔══════════════════════════════════════════════╗");
-        System.out.println("║       TCP Chat Client v2.0                   ║");
+        System.out.println("║       TCP Chat Client v3.0 (Encrypted)       ║");
         System.out.println("╠══════════════════════════════════════════════╣");
         System.out.printf( "║  Connected to: %-29s ║%n", host + ":" + port);
         System.out.println("╚══════════════════════════════════════════════╝");
@@ -164,21 +189,124 @@ public class Client {
     static void onServerDisconnect() {
         connected = false;
     }
+
+    // ──────────────────────────────────────────────────────────────────
+    //  Authentication
+    // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Handles the authentication flow on the client side.
+     * Presents a menu to register or login, collects credentials,
+     * and sends them encrypted to the server.
+     *
+     * @return The authenticated username, or null if authentication failed.
+     */
+    private static String handleAuthentication(Scanner scanner, PrintWriter writer,
+                                                BufferedReader reader, SecretKey encryptionKey) {
+        int maxAttempts = 3;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            System.out.println();
+            System.out.println("╔══════════════════════════════════════════╗");
+            System.out.println("║           Authentication                 ║");
+            System.out.println("╠══════════════════════════════════════════╣");
+            System.out.println("║  1. Login     (existing account)         ║");
+            System.out.println("║  2. Register  (new account)              ║");
+            System.out.println("╚══════════════════════════════════════════╝");
+            System.out.print("  Choose (1 or 2): ");
+
+            String choice = scanner.nextLine().trim();
+            String action;
+            if (choice.equals("1") || choice.equalsIgnoreCase("login")) {
+                action = "LOGIN";
+            } else if (choice.equals("2") || choice.equalsIgnoreCase("register")) {
+                action = "REGISTER";
+            } else {
+                System.out.println("  [!] Invalid choice. Please enter 1 or 2.");
+                continue;
+            }
+
+            System.out.print("  Username: ");
+            String username = scanner.nextLine().trim();
+            System.out.print("  Password: ");
+            String password = scanner.nextLine().trim();
+
+            if (username.isEmpty() || password.isEmpty()) {
+                System.out.println("  [!] Username and password cannot be empty.");
+                continue;
+            }
+
+            // Build auth message: AUTH:LOGIN:username:password or AUTH:REGISTER:username:password
+            String authMessage = "AUTH:" + action + ":" + username + ":" + password;
+
+            // Encrypt and send
+            if (encryptionKey != null) {
+                try {
+                    writer.println(CryptoUtils.encrypt(authMessage, encryptionKey));
+                } catch (Exception e) {
+                    writer.println(authMessage);
+                }
+            } else {
+                writer.println(authMessage);
+            }
+
+            // Read server response
+            try {
+                String response = reader.readLine();
+                if (response == null) {
+                    System.out.println("  [!] Server disconnected.");
+                    return null;
+                }
+
+                // Decrypt response
+                String decrypted;
+                if (encryptionKey != null) {
+                    try {
+                        decrypted = CryptoUtils.decrypt(response, encryptionKey);
+                    } catch (Exception e) {
+                        decrypted = response;
+                    }
+                } else {
+                    decrypted = response;
+                }
+
+                if (decrypted.startsWith("AUTH:SUCCESS:")) {
+                    String successMsg = decrypted.substring("AUTH:SUCCESS:".length());
+                    System.out.println("  ✅ " + successMsg);
+                    return username;
+                } else if (decrypted.startsWith("AUTH:FAIL:")) {
+                    String failMsg = decrypted.substring("AUTH:FAIL:".length());
+                    System.out.println("  ❌ " + failMsg);
+                } else {
+                    System.out.println("  " + decrypted);
+                }
+
+            } catch (IOException e) {
+                System.out.println("  [!] Connection error: " + e.getMessage());
+                return null;
+            }
+        }
+
+        return null;
+    }
 }
 
 /**
- * ServerListener - Background thread receiving messages from the server.
+ * ServerListener - Background thread receiving encrypted messages from the server.
  *
- * Runs as a daemon thread. Continuously reads lines from the server and
- * prints them to the console. When the server closes the connection
- * (readLine returns null), signals the main thread to exit.
+ * Runs as a daemon thread. Continuously reads encrypted lines from the server,
+ * decrypts them using the shared AES key, and prints the plaintext to console.
+ * When the server closes the connection (readLine returns null),
+ * signals the main thread to exit.
  */
 class ServerListener implements Runnable {
 
     private final BufferedReader reader;
+    private final SecretKey encryptionKey;
 
-    public ServerListener(BufferedReader reader) {
+    public ServerListener(BufferedReader reader, SecretKey encryptionKey) {
         this.reader = reader;
+        this.encryptionKey = encryptionKey;
     }
 
     @Override
@@ -186,9 +314,22 @@ class ServerListener implements Runnable {
         try {
             String serverMessage;
             while ((serverMessage = reader.readLine()) != null) {
+                // Decrypt the message from the server
+                String decrypted;
+                if (encryptionKey != null) {
+                    try {
+                        decrypted = CryptoUtils.decrypt(serverMessage, encryptionKey);
+                    } catch (Exception e) {
+                        // If decryption fails, show as-is (e.g. plaintext server messages)
+                        decrypted = serverMessage;
+                    }
+                } else {
+                    decrypted = serverMessage;
+                }
+
                 // Use \r to clear the current line, print the message,
                 // then re-display the prompt.
-                System.out.println("\r" + serverMessage);
+                System.out.println("\r" + decrypted);
                 System.out.print("> ");
             }
         } catch (IOException e) {

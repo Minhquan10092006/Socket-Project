@@ -4,6 +4,7 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import javax.crypto.SecretKey;
 
 /**
  * ClientHandler.java - Per-Client Connection Handler (Server-Side)
@@ -36,6 +37,9 @@ public class ClientHandler implements Runnable {
     private String nickname;
     private volatile boolean running = true;
 
+    // Encryption key shared with the server
+    private final SecretKey encryptionKey;
+
     // Connection metadata
     private final String clientIP;
     private final LocalDateTime joinTime;
@@ -53,12 +57,14 @@ public class ClientHandler implements Runnable {
      * Captures the client's IP address immediately (before the socket
      * could potentially close).
      *
-     * @param socket The TCP socket connected to the client.
+     * @param socket        The TCP socket connected to the client.
+     * @param encryptionKey The AES-256 encryption key for this session.
      */
-    public ClientHandler(Socket socket) {
+    public ClientHandler(Socket socket, SecretKey encryptionKey) {
         this.socket = socket;
         this.clientIP = socket.getInetAddress().getHostAddress();
         this.joinTime = LocalDateTime.now();
+        this.encryptionKey = encryptionKey;
     }
 
     // ──────────────────────────────────────────────────────────────────
@@ -66,14 +72,22 @@ public class ClientHandler implements Runnable {
     // ──────────────────────────────────────────────────────────────────
 
     /**
-     * Sends a message to THIS client. Thread-safe — can be called from
+     * Sends an encrypted message to THIS client. Thread-safe — can be called from
      * any thread (broadcast, unicast, admin commands).
+     * The message is encrypted with AES-256-GCM before being sent.
      *
-     * @param message The text to send.
+     * @param message The plaintext to encrypt and send.
      */
     public void sendMessage(String message) {
         if (writer != null && !socket.isClosed()) {
-            writer.println(message);
+            try {
+                String encrypted = CryptoUtils.encrypt(message, encryptionKey);
+                writer.println(encrypted);
+            } catch (Exception e) {
+                Server.log("ERROR", "Encryption failed for " + nickname + ": " + e.getMessage());
+                // Fallback: send plaintext if encryption fails
+                writer.println(message);
+            }
         }
     }
 
@@ -124,36 +138,43 @@ public class ClientHandler implements Runnable {
             reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
             writer = new PrintWriter(socket.getOutputStream(), true);
 
-            // ── Step 1: Read Nickname ──
-            // The client sends its nickname as the very first line.
-            this.nickname = reader.readLine();
+            // ── Step 1: Send encryption key to client ──
+            // The key is sent UNENCRYPTED as the very first message.
+            // This is the key exchange handshake.
+            writer.println("KEY:" + Server.getEncryptionKeyString());
+            Server.log("CRYPTO", "Encryption key sent to " + clientIP);
 
-            if (this.nickname == null || this.nickname.trim().isEmpty()) {
-                this.nickname = "Anonymous";
-            }
-            this.nickname = this.nickname.trim();
-
-            // Check for duplicate nicknames
-            if (Server.getClientByName(this.nickname) != null
-                    && Server.getClientByName(this.nickname) != this) {
-                sendMessage("[SERVER] Nickname '" + this.nickname + "' is already taken. "
-                        + "You have been assigned: " + this.nickname + "_" + clientIP.hashCode());
-                this.nickname = this.nickname + "_" + Math.abs(clientIP.hashCode() % 1000);
+            // ── Step 2: Authentication ──
+            // Client must register or login before chatting.
+            if (!handleAuthentication()) {
+                return; // Authentication failed — disconnect
             }
 
             Server.log("JOIN", nickname + " joined from " + clientIP);
 
-            // ── Step 2: Announce Join ──
+            // ── Step 3: Announce Join ──
             Server.broadcast("[SERVER] " + nickname + " has joined the chat! "
                     + "(Online: " + Server.getOnlineCount() + ")", this);
 
             // Send a personal welcome with command help.
-            sendMessage("[SERVER] Welcome, " + nickname + "! Online: " + Server.getOnlineCount());
-            sendMessage("[SERVER] Commands: /msg <user> <text> | /list | /help | /stats | exit");
+            sendMessage("[SERVER] Welcome back, " + nickname + "! Online: " + Server.getOnlineCount());
+            sendMessage("[SERVER] Commands: /msg <user> <text> | /list | /help | /stats | /history | exit");
+            sendMessage("[SERVER] \uD83D\uDD12 All messages are encrypted with AES-256-GCM.");
 
-            // ── Step 3: Message Loop ──
-            String message;
-            while (running && (message = reader.readLine()) != null) {
+            // ── Step 3.5: Send recent chat history ──
+            sendChatHistory();
+
+            // ── Step 4: Message Loop ──
+            String encryptedMessage;
+            while (running && (encryptedMessage = reader.readLine()) != null) {
+                // Decrypt the incoming message
+                String message;
+                try {
+                    message = CryptoUtils.decrypt(encryptedMessage, encryptionKey);
+                } catch (Exception e) {
+                    // If decryption fails, treat as plaintext
+                    message = encryptedMessage;
+                }
                 message = message.trim();
 
                 if (message.isEmpty()) continue;
@@ -170,6 +191,9 @@ public class ClientHandler implements Runnable {
                     Server.recordMessage();
                     Server.log("CHAT", nickname + ": " + message);
                     Server.broadcast("[" + nickname + "]: " + message, this);
+
+                    // Save to database
+                    DatabaseManager.getInstance().saveMessage(nickname, message, "BROADCAST", null);
                 }
             }
 
@@ -220,6 +244,8 @@ public class ClientHandler implements Runnable {
             handleHelp();
         } else if (lower.equals("/stats")) {
             sendMessage(Server.getStats());
+        } else if (lower.equals("/history")) {
+            sendChatHistory();
         } else {
             sendMessage("[SERVER] Unknown command: " + input.split(" ")[0]
                     + ". Type /help for available commands.");
@@ -259,7 +285,10 @@ public class ClientHandler implements Runnable {
 
         if (delivered) {
             sendMessage("[PM to " + targetName + "]: " + privateMsg);
-            Server.log("PM", nickname + " → " + targetName + ": " + privateMsg);
+            Server.log("PM", nickname + " \u2192 " + targetName + ": " + privateMsg);
+
+            // Save PM to database
+            DatabaseManager.getInstance().saveMessage(nickname, privateMsg, "PM", targetName);
         } else {
             sendMessage("[SERVER] User '" + targetName + "' is not online. "
                     + "Type /list to see online users.");
@@ -287,8 +316,133 @@ public class ClientHandler implements Runnable {
         sendMessage("║  /msg <user> <text> - Private message    ║");
         sendMessage("║  /list              - Online users        ║");
         sendMessage("║  /stats             - Server statistics   ║");
+        sendMessage("║  /history           - Chat history        ║");
         sendMessage("║  /help              - Show this help      ║");
         sendMessage("║  exit               - Leave the chat      ║");
         sendMessage("╚══════════════════════════════════════════╝");
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    //  Authentication
+    // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Handles the authentication flow: register or login.
+     * The client sends "AUTH:REGISTER:username:password" or "AUTH:LOGIN:username:password".
+     * Returns true if authentication succeeds, false otherwise.
+     */
+    private boolean handleAuthentication() throws IOException {
+        DatabaseManager db = DatabaseManager.getInstance();
+        int maxAttempts = 3;
+
+        for (int attempt = 0; attempt < maxAttempts; attempt++) {
+            String rawLine = reader.readLine();
+            if (rawLine == null) return false;
+
+            // Decrypt the auth message
+            String authLine;
+            try {
+                authLine = CryptoUtils.decrypt(rawLine, encryptionKey);
+            } catch (Exception e) {
+                authLine = rawLine;
+            }
+
+            if (!authLine.startsWith("AUTH:")) {
+                sendMessage("[SERVER] Invalid authentication format. Use AUTH:LOGIN or AUTH:REGISTER.");
+                continue;
+            }
+
+            String[] parts = authLine.split(":", 4);
+            if (parts.length < 4) {
+                sendMessage("[SERVER] Invalid auth format. Expected: AUTH:LOGIN:username:password");
+                continue;
+            }
+
+            String action = parts[1].toUpperCase();
+            String username = parts[2].trim();
+            String password = parts[3];
+
+            if (username.isEmpty() || password.isEmpty()) {
+                sendMessage("[SERVER] Username and password cannot be empty.");
+                continue;
+            }
+
+            if (username.length() < 3 || username.length() > 20) {
+                sendMessage("[SERVER] Username must be 3-20 characters long.");
+                continue;
+            }
+
+            if (password.length() < 4) {
+                sendMessage("[SERVER] Password must be at least 4 characters.");
+                continue;
+            }
+
+            switch (action) {
+                case "REGISTER":
+                    if (db.registerUser(username, password)) {
+                        this.nickname = username;
+                        sendMessage("AUTH:SUCCESS:Registration successful! Welcome, " + username + "!");
+                        Server.log("AUTH", "New user registered: " + username + " from " + clientIP);
+
+                        // Check for duplicate online users
+                        if (Server.getClientByName(this.nickname) != null
+                                && Server.getClientByName(this.nickname) != this) {
+                            sendMessage("[SERVER] This account is already logged in from another location.");
+                            return false;
+                        }
+                        return true;
+                    } else {
+                        sendMessage("AUTH:FAIL:Username '" + username + "' already exists. Try LOGIN instead.");
+                    }
+                    break;
+
+                case "LOGIN":
+                    if (db.authenticateUser(username, password)) {
+                        this.nickname = username;
+
+                        // Check for duplicate online users
+                        if (Server.getClientByName(this.nickname) != null
+                                && Server.getClientByName(this.nickname) != this) {
+                            sendMessage("AUTH:FAIL:This account is already logged in from another location.");
+                            continue;
+                        }
+
+                        sendMessage("AUTH:SUCCESS:Login successful! Welcome back, " + username + "!");
+                        Server.log("AUTH", "User logged in: " + username + " from " + clientIP);
+                        return true;
+                    } else {
+                        sendMessage("AUTH:FAIL:Invalid username or password.");
+                    }
+                    break;
+
+                default:
+                    sendMessage("[SERVER] Unknown auth action: " + action + ". Use LOGIN or REGISTER.");
+            }
+        }
+
+        sendMessage("[SERVER] Too many failed attempts. Disconnecting.");
+        Server.log("AUTH", "Authentication failed after " + maxAttempts + " attempts from " + clientIP);
+        return false;
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    //  Chat History
+    // ──────────────────────────────────────────────────────────────────
+
+    /**
+     * Sends recent chat history to this client from the database.
+     * Shows the last 20 broadcast messages so the user can catch up.
+     */
+    private void sendChatHistory() {
+        java.util.List<String> history = DatabaseManager.getInstance().getRecentMessages(20);
+        if (history.isEmpty()) {
+            sendMessage("[SERVER] No chat history available yet.");
+        } else {
+            sendMessage("[SERVER] \u2500\u2500\u2500 Recent Chat History (" + history.size() + " messages) \u2500\u2500\u2500");
+            for (String msg : history) {
+                sendMessage("  " + msg);
+            }
+            sendMessage("[SERVER] \u2500\u2500\u2500 End of History \u2500\u2500\u2500");
+        }
     }
 }

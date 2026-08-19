@@ -1,0 +1,38 @@
+# ═══════════════════════════════════════════════════════════════════
+# SecureChat — Docker Compose Configuration
+# ═══════════════════════════════════════════════════════════════════
+#
+# Start everything with:
+#   docker-compose up -d
+#
+# Stop:
+#   docker-compose down
+#
+# View logs:
+#   docker-compose logs -f
+# ═══════════════════════════════════════════════════════════════════
+
+version: '3.8'
+
+services:
+  securechat-server:
+    build: .
+    container_name: securechat
+    ports:
+      - "5000:5000"   # TCP Chat (terminal clients)
+      - "5001:5001"   # WebSocket (web clients)
+      - "5002:5002"   # HTTP (web UI)
+    volumes:
+      - chat-data:/app   # Persist SQLite database
+    restart: unless-stopped
+    environment:
+      - JAVA_OPTS=-Xmx256m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 5000 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  chat-data:
+    driver: local
