@@ -23,16 +23,7 @@ services:
       - "5001:5001"   # WebSocket (web clients)
       - "5002:5002"   # HTTP (web UI)
     volumes:
-      - chat-data:/app   # Persist SQLite database
+      # Mount file cơ sở dữ liệu SQLite ra máy host để dữ liệu không bao giờ bị mất
+      # ngay cả khi xóa container hay rebuild image mới
+      - ./chat_server.db:/app/chat_server.db
     restart: unless-stopped
-    environment:
-      - JAVA_OPTS=-Xmx256m
-    healthcheck:
-      test: ["CMD-SHELL", "nc -z localhost 5000 || exit 1"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-volumes:
-  chat-data:
-    driver: local
