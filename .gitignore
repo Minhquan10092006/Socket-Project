@@ -12,3 +12,6 @@
 *.db
 *.db-shm
 *.db-wal
+
+# Ignore Node.js dependencies
+node_modules/

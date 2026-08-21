@@ -1,0 +1,20 @@
+{
+  "name": "securechat-web",
+  "version": "1.0.0",
+  "description": "SecureChat Web Client - Encrypted Real-Time Messenger",
+  "scripts": {
+    "dev": "python3 -m http.server 8000",
+    "start": "python3 -m http.server 8000"
+  },
+  "keywords": [
+    "chat",
+    "websocket",
+    "encryption",
+    "secure"
+  ],
+  "author": "Socket-Project Team",
+  "license": "MIT",
+  "dependencies": {
+    "@vercel/analytics": "^2.0.1"
+  }
+}
